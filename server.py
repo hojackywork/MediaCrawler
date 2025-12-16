@@ -1,86 +1,56 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import subprocess
 import os
 import glob
 import json
-import time
 
 app = FastAPI()
+DATA_DIR = "data"
 
-# 定義請求數據模型 (這是新加的，用來接收 n8n 傳來的 JSON)
 class CrawlRequest(BaseModel):
     keywords: str
-    platform: str = "xhs"  # 預設為 xhs，可選: dy, ks, bilibili, wb
+    platform: str = "xhs"
 
-# 設置數據保存目錄 (MediaCrawler 默認是 data/)
-DATA_DIR = "data"
+def run_crawler_task(cmd: str):
+    print(f"Starting background task: {cmd}")
+    try:
+        # 使用 300秒 (5分鐘) 超時，足夠爬完
+        subprocess.run(cmd, shell=True, timeout=300) 
+        print("Task finished successfully")
+    except Exception as e:
+        print(f"Task failed: {e}")
 
 @app.get("/")
 def read_root():
-    return {"status": "MediaCrawler API is ready (Multi-Platform Supported)"}
+    return {"status": "MediaCrawler API (Async Mode) is ready"}
 
 @app.post("/crawl")
-def trigger_crawl(request: CrawlRequest):
-    # 1. 驗證平台參數
-    valid_platforms = ["xhs", "dy", "ks", "bilibili", "wb"]
-    if request.platform not in valid_platforms:
-        return {"status": "error", "message": f"Invalid platform. Choose from {valid_platforms}"}
-
-    # 2. 構建命令
-    # 使用 f-string 動態插入 platform 和 keywords
-    # 注意：這裡的 main.py 參數必須符合你使用的 MediaCrawler 版本
+def trigger_crawl(request: CrawlRequest, background_tasks: BackgroundTasks):
+    # 1. 構建命令
     cmd = f"python main.py --platform {request.platform} --lt qrcode --type search --keywords '{request.keywords}'"
     
-    print(f"Executing command: {cmd}")
+    # 2. 將爬蟲任務丟到後台執行，不讓 HTTP 連線等待
+    background_tasks.add_task(run_crawler_task, cmd)
     
-    # 3. 執行爬蟲 (設置超時時間 3 分鐘)
-    # capture_output=True 會抓取標準輸出，方便我們 debug
-    try:
-        result = subprocess.run(
-            cmd, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
-            timeout=180 
-        )
-    except subprocess.TimeoutExpired:
-        # 如果超時，嘗試殺死進程並返回錯誤
-        return {"status": "error", "message": "Crawling timed out (took > 180s)"}
+    return {"status": "started", "message": f"Crawling {request.keywords} in background..."}
 
-    # 4. 讀取結果
-    # 邏輯：尋找 data/ 目錄下最新生成的 json 文件
+@app.get("/results")
+def get_results():
+    # 獲取最新的數據文件
     try:
         list_of_files = glob.glob(os.path.join(DATA_DIR, '*.json'))
-        
         if not list_of_files:
-            # 如果沒找到文件，通常是爬蟲報錯了，返回 logs 讓用戶去 debug
-            # 截取最後 1000 個字符的日誌
-            return {
-                "status": "empty", 
-                "message": "No data found. Check logs for cookie issues.", 
-                "logs": result.stderr[-1000:] + result.stdout[-1000:]
-            }
+            return {"status": "empty", "message": "No data yet. Keep waiting."}
             
-        # 找到最新文件
         latest_file = max(list_of_files, key=os.path.getctime)
-        
-        # 讀取內容
         with open(latest_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
             
         return {
             "status": "success",
-            "platform": request.platform,
-            "keyword": request.keywords,
-            "count": len(data),
-            "data": data,
-            "source_file": latest_file
+            "file": os.path.basename(latest_file),
+            "data": data
         }
-            
     except Exception as e:
-        return {
-            "status": "error", 
-            "message": str(e), 
-            "logs": result.stderr[-500:] if 'result' in locals() else "Unknown error"
-        }
+        return {"status": "error", "message": str(e)}
